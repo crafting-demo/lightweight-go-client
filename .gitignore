@@ -1,0 +1,4 @@
+# Build and test artifacts
+*.test
+*.out
+/dist/
