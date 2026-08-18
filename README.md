@@ -21,21 +21,45 @@ if err != nil {
     return err
 }
 
+name, err := crafting.DeriveSandboxName("agent", workflowID)
 ref, err := client.CreateSandbox(ctx, crafting.CreateSandboxOptions{
-    Name:     "my-sandbox",
+    Name:     name,
     Template: "agent-sandbox",
     Env:      []string{"FEATURE_FLAG=on"},
 })
-if err != nil {
-    return err
-}
 defer client.DeleteSandbox(ctx, ref)
 
-res, err := client.Exec(ctx, ref, crafting.ExecOptions{Workload: "dev"}, "go test ./...")
+res, err := client.Exec(ctx, ref, crafting.ExecOptions{
+    Workload:   "dev",
+    AutoResume: true,
+}, "go test ./...")
 if err != nil {
     return err // the command could not be run
 }
 fmt.Println(res.ExitCode, res.Stdout, res.Stderr)
+
+if err := client.SuspendSandbox(ctx, ref); err != nil {
+    return err
+}
+if err := client.ResumeSandbox(ctx, ref, crafting.ResumeOptions{Workload: "dev"}); err != nil {
+    return err
+}
+_ = client.EnsureResumed(ctx, ref, crafting.ResumeOptions{Workload: "dev"})
+stage, _ := client.LifecycleStage(ctx, ref) // RUNNING or SUSPENDED
+
+snap, err := client.SnapshotSandbox(ctx, ref, crafting.SnapshotOptions{
+    Workspace:    "dev",
+    Dependencies: []string{"db"},
+})
+defer client.DeleteSnapshot(ctx, snap)
+
+id, err := snap.Encode()
+restored, err := crafting.DecodeCompositeSnapshot(id)
+
+fork, err := client.CreateSandbox(ctx, crafting.CreateSandboxOptions{
+    Name: "fork-a", Template: "agent-sandbox", From: restored,
+})
+defer client.DeleteSandbox(ctx, fork)
 ```
 
 A command that runs and fails is a result, not an error: it comes back with a
@@ -49,27 +73,13 @@ Most sandbox tooling snapshots a filesystem. A Crafting sandbox is a workspace
 directory, the data inside each dependency, and optionally the workspace root
 filesystem, captured together and restored together.
 
-```go
-snap, err := client.SnapshotSandbox(ctx, ref, crafting.SnapshotOptions{
-    Workspace:    "dev",
-    Dependencies: []string{"db"},
-})
+Restoring the same snapshot twice yields two independent sandboxes, each with
+its own copy of the files *and* its own copy of the database, so two candidate
+changes can run in parallel without either seeing the other's rows.
 
-forkA, err := client.CreateSandbox(ctx, crafting.CreateSandboxOptions{
-    Name: "fork-a", Template: "agent-sandbox", From: snap,
-})
-forkB, err := client.CreateSandbox(ctx, crafting.CreateSandboxOptions{
-    Name: "fork-b", Template: "agent-sandbox", From: snap,
-})
-```
-
-`forkA` and `forkB` each get their own copy of the files *and* their own copy of
-the database, so two candidate changes can run in parallel without either seeing
-the other's rows.
-
-`CompositeSnapshot` round-trips through a single opaque string via `Encode` and
-`DecodeCompositeSnapshot`, for callers that can only persist a string — a
-workflow history, for instance.
+`Encode` / `DecodeCompositeSnapshot` pack that composite into a single opaque
+string, for callers that can only persist a string — a workflow history, for
+instance.
 
 ## Naming
 
@@ -77,10 +87,6 @@ Crafting sandbox names are at most 20 characters and must start with a letter,
 so external identifiers rarely fit. `DeriveSandboxName` hashes one into a valid
 name deterministically, which also makes creation idempotent: the same seed
 resolves to the same sandbox rather than a duplicate.
-
-```go
-name, err := crafting.DeriveSandboxName("agent", someWorkflowID)
-```
 
 ## Authentication
 
